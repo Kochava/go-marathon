@@ -17,6 +17,7 @@ limitations under the License.
 package marathon
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -50,6 +51,10 @@ func (r *marathonClient) AddEventsListener(filter int) (EventsChannel, error) {
 	r.Lock()
 	defer r.Unlock()
 
+	if r.closed {
+		return nil, ErrClosed
+	}
+
 	// step: someone has asked to start listening to event, we need to register for events
 	// if we haven't done so already
 	if err := r.registerSubscription(); err != nil {
@@ -71,8 +76,20 @@ func (r *marathonClient) RemoveEventsListener(channel EventsChannel) {
 	r.Lock()
 	defer r.Unlock()
 
+	if r.closed {
+		return
+	}
+
+	r.removeEventsListener(channel)
+}
+
+func (r *marathonClient) removeEventsListener(channel EventsChannel) {
 	if context, found := r.listeners[channel]; found {
-		close(context.done)
+		select {
+		case <-context.done:
+		default:
+			close(context.done)
+		}
 		delete(r.listeners, channel)
 		// step: if there is no one else listening, let's remove ourselves
 		// from the events callback
@@ -183,12 +200,18 @@ func (r *marathonClient) registerSSESubscription() error {
 			stream, err := r.connectToSSE()
 			if err != nil {
 				r.debugLog("Error connecting SSE subscription: %s", err)
-				<-time.After(5 * time.Second)
+				select {
+				case <-time.After(5 * time.Second):
+				case <-r.done:
+					return
+				}
 				continue
 			}
+			defer stream.Close()
 			err = r.listenToSSE(stream)
-			stream.Close()
-			r.debugLog("Error on SSE subscription: %s", err)
+			if err != nil {
+				r.debugLog("Error on SSE subscription: %s", err)
+			}
 		}
 	}()
 
@@ -201,7 +224,7 @@ func (r *marathonClient) registerSSESubscription() error {
 // Given the http request can not be built, it will panic as this case should never happen.
 func (r *marathonClient) connectToSSE() (*eventsource.Stream, error) {
 	for {
-		request, member, err := r.buildAPIRequest("GET", marathonAPIEventStream, nil)
+		request, member, err := r.buildAPIRequest(context.Background(), "GET", marathonAPIEventStream, nil)
 		if err != nil {
 			switch err.(type) {
 			case newRequestError:
@@ -235,6 +258,8 @@ func (r *marathonClient) connectToSSE() (*eventsource.Stream, error) {
 func (r *marathonClient) listenToSSE(stream *eventsource.Stream) error {
 	for {
 		select {
+		case <-r.done:
+			return nil
 		case ev := <-stream.Events:
 			if err := r.handleEvent(ev.Data()); err != nil {
 				r.debugLog("listenToSSE(): failed to handle event: %v", err)

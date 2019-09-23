@@ -18,6 +18,7 @@ package marathon
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,6 +33,9 @@ import (
 	"sync"
 	"time"
 )
+
+// ErrClosed is returned by a Marathon client's Close method if the client is already closed.
+var ErrClosed = errors.New("client is closed")
 
 // Marathon is the interface to the marathon API
 type Marathon interface {
@@ -182,6 +186,10 @@ type Marathon interface {
 	Leader() (string, error)
 	// cause the current leader to abdicate
 	AbdicateLeader() (string, error)
+
+	// Close stops the client and any ongoing operations (connections, checks, goroutines).
+	// Returns ErrClosed if the client is already closed.
+	Close() error
 }
 
 var (
@@ -234,6 +242,12 @@ type marathonClient struct {
 	debugLog func(format string, v ...interface{})
 	// the marathon HTTP client to ensure consistency in requests
 	client *httpClient
+	// closed is set by Close() before stopping the cluster and controls whether ErrClosed is
+	// returned by Close().
+	closed bool
+	// done is closed by Close() before stopping the cluster. It is used to signal to goroutines
+	// that the client is shutting down.
+	done chan struct{}
 }
 
 type httpClient struct {
@@ -291,7 +305,34 @@ func NewClient(config Config) (Marathon, error) {
 		hosts:     hosts,
 		debugLog:  debugLog,
 		client:    client,
+		done:      make(chan struct{}),
 	}, nil
+}
+
+func (r *marathonClient) Close() error {
+	r.Lock()
+	defer r.Unlock()
+	if r.closed {
+		return ErrClosed
+	}
+	for ec := range r.listeners {
+		r.removeEventsListener(ec)
+	}
+	r.closed = true
+	close(r.done)
+	r.hosts.stop()
+	return nil
+}
+
+// isClosed returns whether the client is closed. This is done without taking any locks to encourage
+// isClosed checks in all cases, regardless of use.
+func (r *marathonClient) isClosed() bool {
+	select {
+	case <-r.done:
+		return true
+	default:
+		return false
+	}
 }
 
 // GetMarathonURL retrieves the marathon url
@@ -308,26 +349,26 @@ func (r *marathonClient) Ping() (bool, error) {
 }
 
 func (r *marathonClient) apiHead(path string, result interface{}) error {
-	return r.apiCall("HEAD", path, nil, result)
+	return r.apiCall(context.TODO(), "HEAD", path, nil, result)
 }
 
 func (r *marathonClient) apiGet(path string, post, result interface{}) error {
-	return r.apiCall("GET", path, post, result)
+	return r.apiCall(context.TODO(), "GET", path, post, result)
 }
 
 func (r *marathonClient) apiPut(path string, post, result interface{}) error {
-	return r.apiCall("PUT", path, post, result)
+	return r.apiCall(context.TODO(), "PUT", path, post, result)
 }
 
 func (r *marathonClient) apiPost(path string, post, result interface{}) error {
-	return r.apiCall("POST", path, post, result)
+	return r.apiCall(context.TODO(), "POST", path, post, result)
 }
 
 func (r *marathonClient) apiDelete(path string, post, result interface{}) error {
-	return r.apiCall("DELETE", path, post, result)
+	return r.apiCall(context.TODO(), "DELETE", path, post, result)
 }
 
-func (r *marathonClient) apiCall(method, path string, body, result interface{}) error {
+func (r *marathonClient) apiCall(ctx context.Context, method, path string, body, result interface{}) error {
 	const deploymentHeader = "Marathon-Deployment-Id"
 
 	for {
@@ -341,14 +382,19 @@ func (r *marathonClient) apiCall(method, path string, body, result interface{}) 
 		}
 
 		// step: create the API request
-		request, member, err := r.buildAPIRequest(method, path, bytes.NewReader(requestBody))
+		request, member, err := r.buildAPIRequest(ctx, method, path, bytes.NewReader(requestBody))
 		if err != nil {
 			return err
 		}
 
 		// step: perform the API request
 		response, err := r.client.Do(request)
-		if err != nil {
+		if err == context.Canceled || err == context.DeadlineExceeded {
+			if r.isClosed() {
+				return ErrClosed
+			}
+			return err
+		} else if err != nil {
 			r.hosts.markDown(member)
 			// step: attempt the request on another member
 			r.debugLog("apiCall(): request failed on host: %s, error: %s, trying another", member, err)
@@ -426,7 +472,10 @@ func (r *marathonClient) wait(name string, timeout time.Duration, fn func(string
 
 // buildAPIRequest creates a default API request.
 // It fails when there is no available member in the cluster anymore or when the request can not be built.
-func (r *marathonClient) buildAPIRequest(method, path string, reader io.Reader) (request *http.Request, member string, err error) {
+func (r *marathonClient) buildAPIRequest(ctx context.Context, method, path string, reader io.Reader) (request *http.Request, member string, err error) {
+	if r.isClosed() {
+		return nil, "", ErrClosed
+	}
 	// Grab a member from the cluster
 	member, err = r.hosts.getMember()
 	if err != nil {
@@ -434,7 +483,7 @@ func (r *marathonClient) buildAPIRequest(method, path string, reader io.Reader) 
 	}
 
 	// Build the HTTP request to Marathon
-	request, err = r.client.buildMarathonJSONRequest(method, member, path, reader)
+	request, err = r.client.buildMarathonJSONRequest(ctx, method, member, path, reader)
 	if err != nil {
 		return nil, member, newRequestError{err}
 	}
@@ -443,8 +492,8 @@ func (r *marathonClient) buildAPIRequest(method, path string, reader io.Reader) 
 
 // buildMarathonJSONRequest is like buildMarathonRequest but sets the
 // Content-Type and Accept headers to application/json.
-func (rc *httpClient) buildMarathonJSONRequest(method, member, path string, reader io.Reader) (request *http.Request, err error) {
-	req, err := rc.buildMarathonRequest(method, member, path, reader)
+func (rc *httpClient) buildMarathonJSONRequest(ctx context.Context, method, member, path string, reader io.Reader) (request *http.Request, err error) {
+	req, err := rc.buildMarathonRequest(ctx, method, member, path, reader)
 	if err == nil {
 		req.Header.Add("Content-Type", "application/json")
 		req.Header.Add("Accept", "application/json")
@@ -455,7 +504,7 @@ func (rc *httpClient) buildMarathonJSONRequest(method, member, path string, read
 
 // buildMarathonRequest creates a new HTTP request and configures it according to the *httpClient configuration.
 // The path must not contain a leading "/", otherwise buildMarathonRequest will panic.
-func (rc *httpClient) buildMarathonRequest(method, member, path string, reader io.Reader) (request *http.Request, err error) {
+func (rc *httpClient) buildMarathonRequest(ctx context.Context, method, member, path string, reader io.Reader) (request *http.Request, err error) {
 	if strings.HasPrefix(path, "/") {
 		panic(fmt.Sprintf("Path '%s' must not start with a leading slash", path))
 	}
@@ -464,7 +513,7 @@ func (rc *httpClient) buildMarathonRequest(method, member, path string, reader i
 	url := fmt.Sprintf("%s/%s", member, path)
 
 	// Instantiate an HTTP request
-	request, err = http.NewRequest(method, url, reader)
+	request, err = http.NewRequestWithContext(ctx, method, url, reader)
 	if err != nil {
 		return nil, err
 	}

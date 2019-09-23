@@ -17,6 +17,7 @@ limitations under the License.
 package marathon
 
 import (
+	"context"
 	"fmt"
 	"net/url"
 	"strings"
@@ -42,6 +43,12 @@ type cluster struct {
 	// healthCheckInterval is the interval by which we probe down nodes for
 	// availability again.
 	healthCheckInterval time.Duration
+	// stopping gates the close(closed) call and blocks until healthCheckWG drains.
+	stopping sync.Once
+	// done is closed to signal to cluster operations that they can all stop.
+	done chan struct{}
+	// clusterWG tracks all non-closed operations against the cluster
+	clusterWG sync.WaitGroup
 }
 
 // member represents an individual endpoint
@@ -100,7 +107,43 @@ func newCluster(client *httpClient, marathonURL string, isDCOS bool) (*cluster, 
 		client:              client,
 		members:             members,
 		healthCheckInterval: 5 * time.Second,
+		done:                make(chan struct{}),
 	}, nil
+}
+
+func (c *cluster) stop() {
+	// Block operations while stopping
+	c.Lock()
+	defer c.Unlock()
+	c.stopping.Do(func() {
+		close(c.done)
+		c.clusterWG.Wait()
+	})
+}
+
+func (c *cluster) stopped() bool {
+	select {
+	case <-c.done:
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *cluster) cancelOnStop(ctx context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(ctx)
+	if c.stopped() {
+		cancel()
+		return ctx, cancel
+	}
+	go func() {
+		select {
+		case <-c.done:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
 }
 
 // retrieve the current member, i.e. the current endpoint in use
@@ -118,6 +161,9 @@ func (c *cluster) getMember() (string, error) {
 
 // markDown marks down the current endpoint
 func (c *cluster) markDown(endpoint string) {
+	if c.stopped() {
+		return
+	}
 	c.Lock()
 	defer c.Unlock()
 	for _, n := range c.members {
@@ -125,19 +171,30 @@ func (c *cluster) markDown(endpoint string) {
 		// nodes status ensures the multiple calls don't create multiple checks
 		if n.status == memberStatusUp && n.endpoint == endpoint {
 			n.status = memberStatusDown
-			go c.healthCheckNode(n)
+			ctx, cancel := c.cancelOnStop(context.Background())
+			c.clusterWG.Add(1)
+			go func() {
+				defer c.clusterWG.Done()
+				defer cancel()
+				c.healthCheckNode(ctx, n)
+			}()
 			break
 		}
 	}
 }
 
 // healthCheckNode performs a health check on the node and when active updates the status
-func (c *cluster) healthCheckNode(node *member) {
+func (c *cluster) healthCheckNode(ctx context.Context, node *member) {
 	// step: wait for the node to become active ... we are assuming a /ping is enough here
 	ticker := time.NewTicker(c.healthCheckInterval)
 	defer ticker.Stop()
-	for range ticker.C {
-		req, err := c.client.buildMarathonRequest("GET", node.endpoint, "ping", nil)
+	for {
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			break
+		}
+		req, err := c.client.buildMarathonRequest(ctx, "GET", node.endpoint, "ping", nil)
 		if err == nil {
 			res, err := c.client.Do(req)
 			if err == nil && res.StatusCode == 200 {
@@ -147,6 +204,8 @@ func (c *cluster) healthCheckNode(node *member) {
 				c.Unlock()
 				break
 			}
+		} else if err == context.Canceled {
+			break
 		}
 	}
 }

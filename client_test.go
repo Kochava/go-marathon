@@ -18,6 +18,7 @@ package marathon
 
 import (
 	"bytes"
+	"context"
 	"testing"
 
 	"net/http"
@@ -42,6 +43,25 @@ func TestNewClient(t *testing.T) {
 	assert.Equal(t, conf.HTTPSSEClient, defaultHTTPSSEClient)
 	assert.Zero(t, conf.HTTPSSEClient.Timeout)
 	assert.Equal(t, conf.PollingWaitTime, defaultPollingWaitTime)
+}
+
+func TestStop(t *testing.T) {
+	config := NewDefaultConfig()
+	endpoint := newFakeMarathonEndpoint(t, &configContainer{
+		client: &config,
+		server: &serverConfig{},
+	})
+
+	err := endpoint.Client.Close()
+	assert.NoError(t, err, "Close() should not return an error on first call")
+
+	err = endpoint.Client.Close()
+	assert.Equal(t, ErrClosed, err, "Close() should return ErrClosed if called after another Close()")
+
+	_, err = endpoint.Client.Applications(nil)
+	assert.Equal(t, ErrClosed, err, "API calls should return ErrClosed after Close()")
+
+	endpoint.Close()
 }
 
 func TestHTTPClientDefaults(t *testing.T) {
@@ -245,7 +265,7 @@ func TestBuildApiRequestFailure(t *testing.T) {
 			}
 		}
 
-		_, _, err := client.buildAPIRequest("GET", test.path, nil)
+		_, _, err := client.buildAPIRequest(context.Background(), "GET", test.path, nil)
 
 		if test.expectedError != nil {
 			assert.Equal(t, test.expectedError, err)
