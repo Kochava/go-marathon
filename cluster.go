@@ -113,11 +113,11 @@ func newCluster(client *httpClient, marathonURL string, isDCOS bool) (*cluster, 
 
 func (c *cluster) stop() {
 	// Block operations while stopping
+	defer c.clusterWG.Wait()
 	c.Lock()
 	defer c.Unlock()
 	c.stopping.Do(func() {
 		close(c.done)
-		c.clusterWG.Wait()
 	})
 }
 
@@ -188,7 +188,7 @@ func (c *cluster) healthCheckNode(ctx context.Context, node *member) {
 	// step: wait for the node to become active ... we are assuming a /ping is enough here
 	ticker := time.NewTicker(c.healthCheckInterval)
 	defer ticker.Stop()
-	for {
+	for ctx.Err() == nil {
 		select {
 		case <-ticker.C:
 		case <-ctx.Done():
@@ -202,10 +202,10 @@ func (c *cluster) healthCheckNode(ctx context.Context, node *member) {
 				c.Lock()
 				node.status = memberStatusUp
 				c.Unlock()
-				break
+				return
 			}
 		} else if err == context.Canceled {
-			break
+			return
 		}
 	}
 }
