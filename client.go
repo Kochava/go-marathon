@@ -371,7 +371,10 @@ func (r *marathonClient) apiDelete(path string, post, result interface{}) error 
 func (r *marathonClient) apiCall(ctx context.Context, method, path string, body, result interface{}) error {
 	const deploymentHeader = "Marathon-Deployment-Id"
 
-	for {
+	ctx, cancel := r.hosts.cancelOnStop(ctx)
+	defer cancel()
+
+	for !r.isClosed() {
 		// step: marshall the request to json
 		var requestBody []byte
 		var err error
@@ -447,6 +450,7 @@ func (r *marathonClient) apiCall(ctx context.Context, method, path string, body,
 
 		return NewAPIError(response.StatusCode, respBody)
 	}
+	return ErrClosed
 }
 
 // wait waits until the provided function returns true (or times out)
@@ -505,6 +509,10 @@ func (rc *httpClient) buildMarathonJSONRequest(ctx context.Context, method, memb
 // buildMarathonRequest creates a new HTTP request and configures it according to the *httpClient configuration.
 // The path must not contain a leading "/", otherwise buildMarathonRequest will panic.
 func (rc *httpClient) buildMarathonRequest(ctx context.Context, method, member, path string, reader io.Reader) (request *http.Request, err error) {
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+
 	if strings.HasPrefix(path, "/") {
 		panic(fmt.Sprintf("Path '%s' must not start with a leading slash", path))
 	}

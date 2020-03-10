@@ -18,6 +18,7 @@ package marathon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
@@ -178,7 +179,7 @@ func (c *cluster) markDown(endpoint string) {
 				defer cancel()
 				c.healthCheckNode(ctx, n)
 			}()
-			break
+			return
 		}
 	}
 }
@@ -195,16 +196,17 @@ func (c *cluster) healthCheckNode(ctx context.Context, node *member) {
 			break
 		}
 		req, err := c.client.buildMarathonRequest(ctx, "GET", node.endpoint, "ping", nil)
-		if err == nil {
-			res, err := c.client.Do(req)
-			if err == nil && res.StatusCode == 200 {
-				// step: mark the node as active again
-				c.Lock()
-				node.status = memberStatusUp
-				c.Unlock()
-				return
-			}
-		} else if err == context.Canceled {
+		if errors.Is(err, context.Canceled) {
+			return
+		} else if err != nil {
+			continue
+		}
+		res, err := c.client.Do(req)
+		if err == nil && res.StatusCode == 200 {
+			// step: mark the node as active again
+			c.Lock()
+			node.status = memberStatusUp
+			c.Unlock()
 			return
 		}
 	}
